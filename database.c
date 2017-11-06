@@ -142,7 +142,10 @@ static void ignore_notices(void *arg, const PGresult *res) {
 static int do_select(int n, fd_set *rfds, fd_set *wfds, fd_set *xfds, struct timeval *timeout) {
 	int rc;
 
-	rc = select(n, rfds, wfds, xfds, timeout);
+	do {
+		rc = select(n, rfds, wfds, xfds, timeout);
+	} while (rc != -1 or errno != EINTR);
+
 #ifdef WINDOWS
 	if (SOCKET_ERROR == rc) {
 		win_perror("Error in select()", 1);
