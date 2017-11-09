@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <libpq-fe.h>
+#include <errno.h>
 #ifdef HAVE_SYS_SELECT_H
 #	include <sys/select.h>
 #else
@@ -84,6 +85,11 @@ struct dbconn {
 /* linked list of open connections */
 static struct dbconn *connections = NULL;
 
+/* Set of FD's we need to wait for events on */
+static fd_set read_fds;
+static fd_set write_fds;
+static struct dbconn *fd_conn_map[FD_SETSIZE];
+
 /* remember timestamp of program start and stop */
 static struct timeval start_time;
 static struct timeval stop_time;
@@ -144,7 +150,7 @@ static int do_select(int n, fd_set *rfds, fd_set *wfds, fd_set *xfds, struct tim
 
 	do {
 		rc = select(n, rfds, wfds, xfds, timeout);
-	} while (rc != -1 or errno != EINTR);
+	} while (rc == -1 && errno == EINTR);
 
 #ifdef WINDOWS
 	if (SOCKET_ERROR == rc) {
@@ -158,17 +164,6 @@ static int do_select(int n, fd_set *rfds, fd_set *wfds, fd_set *xfds, struct tim
 #endif
 
 	return rc;
-}
-
-/* checks if a certain socket can be read or written without blocking */
-
-static int poll_socket(int socket, int for_read, char * const errmsg_prefix) {
-	fd_set fds;
-	struct timeval zero = { 0, 0 };
-
-	FD_ZERO(&fds);
-	FD_SET(socket, &fds);
-	return do_select(socket + 1, for_read ? &fds : NULL, for_read ? NULL : &fds, NULL, &zero);
 }
 
 /* sleep routine that should work on all platforms */
@@ -268,6 +263,9 @@ int database_consumer_init(const char *ignore, const char *host, int port, const
 	}
 
 	replay_factor = factor;
+
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
 
 	/* calculate length of connect string */
 	if (host) {
@@ -395,19 +393,108 @@ int database_consumer(replay_item *item) {
 	time_t i;
 	char *connstr, *p1, errbuf[256];
 	const char *user, *database, *p;
+	int fd;
 	PGcancel *cancel_request;
 	PGresult *result;
 	ExecStatusType result_status;
 
 	debug(3, "Entering database_consumer%s\n", "");
+	
+	/* time when the statement originally ran */
+	stmt_time = replay_get_time(item);
 
-	/* loop through open connections and do what can be done */
-	while ((-1 != rc) && (NULL != conn)) {
-		/* if we find the connection for the current statement, remember it */
-		if (session_id == conn->session_id) {
-			found_conn = conn;
+	/* set first_stmt_time if it is not yet set */
+	if (! fstmtm_set) {
+		first_stmt_time.tv_sec = stmt_time->tv_sec;
+		first_stmt_time.tv_usec = stmt_time->tv_usec;
+
+		fstmtm_set = 1;
+	}
+
+	/* get current time */
+	if (-1 != rc) {
+		if (-1 == gettimeofday(&now, NULL)) {
+			fprintf(stderr, "Error: gettimeofday failed\n");
+			rc = -1;
+		}
+	}
+		/* calculate "target time" when item should be replayed:
+		                                       statement time - first statement time
+		   program start time - skipped time + -------------------------------------
+		                                                   replay factor            */
+
+		/* timestamp of the statement */
+		target_time.tv_sec = stmt_time->tv_sec;
+		target_time.tv_usec = stmt_time->tv_usec;
+
+		/* subtract time of first statement */
+		timersub(&target_time, &first_stmt_time, &target_time);
+
+		/* subtract skipped time */
+		if (jump_enabled) {
+			timersub(&target_time, &jump_total, &target_time);
 		}
 
+		/* divide by replay_factor */
+		if (replay_factor != 1.0) {
+			/* - divide the seconds part by the factor
+			   - divide the microsecond part by the factor and add the
+			     fractional part (times 10^6) of the previous division
+			   - if the result exceeds 10^6, subtract the excess and
+			     add its 10^6th to the seconds part. */
+			d = target_time.tv_sec / replay_factor;
+			target_time.tv_sec = d;
+			target_time.tv_usec = target_time.tv_usec / replay_factor +
+				(d - target_time.tv_sec) * 1000000.0;
+			i = target_time.tv_usec / 1000000;
+			target_time.tv_usec -= i * 1000000;
+			target_time.tv_sec += i;
+		}
+
+		/* add program start time */
+		timeradd(&target_time, &start_time, &target_time);
+
+		/* warn if we fall behind too much */
+		if (secs_behind < now.tv_sec - target_time.tv_sec) {
+			secs_behind = now.tv_sec - target_time.tv_sec;
+			for (j=0; j<NUM_DELAY_STEPS; ++j) {
+				if (! delay_steps[j].shown && delay_steps[j].seconds <= secs_behind) {
+					printf("Execution is %s behind schedule\n", delay_steps[j].display);
+					fflush(stdout);
+					delay_steps[j].shown = 1;
+				}
+			}
+		}
+
+	timersub(&target_time, &now, &delta);
+
+        unsigned long *m = (unsigned long *)__FDS_BITS(&read_fds);
+        unsigned long *n = (unsigned long *)__FDS_BITS(&write_fds);
+        int ctr;
+        for (ctr = 0; ctr < sizeof (fd_set) / sizeof (unsigned long); ++ctr) {
+          if (m[ctr] || n[ctr]) all_idle=0;
+        }
+
+	struct timeval zero = { 0, 0 };
+
+        fd_set fds_for_read = read_fds;
+        fd_set fds_for_write = write_fds;
+
+        // Work to do for other sockets
+        if (do_select(FD_SETSIZE, &fds_for_read, &fds_for_write, NULL, (delta.tv_sec>=0)?&delta:(all_idle?&zero:NULL))) {
+          all_idle = 0;
+          unsigned long *m = (unsigned long *)__FDS_BITS(&fds_for_read);
+          unsigned long *n = (unsigned long *)__FDS_BITS(&fds_for_write);
+          int i;
+          for (i = 0; i < sizeof (fd_set) / sizeof (unsigned long); ++i) {
+            while (m[i] || n[i]) {
+              fd = sizeof (unsigned long) * i * 8 + __builtin_ctzl(m[i] | n[i]);
+              FD_CLR(fd, &fds_for_read);
+              FD_CLR(fd, &fds_for_write);
+              FD_CLR(fd, &read_fds);
+              FD_CLR(fd, &write_fds);
+              conn = fd_conn_map[fd];
+              debug(2, "FD event for session 0x" UINT64_FORMAT " established\n", conn->session_id);
 		/* handle each connection according to status */
 		switch(conn->status) {
 			case idle:
@@ -417,22 +504,16 @@ int database_consumer(replay_item *item) {
 			case conn_wait_read:
 			case conn_wait_write:
 				/* in connection process */
-				/* check if socket is still busy */
-				switch (poll_socket(conn->socket, (conn_wait_read == conn->status), "Error polling socket during connect")) {
-					case 0:
-						/* socket still busy */
-						debug(2, "Socket for session 0x" UINT64_FORMAT " busy for %s during connect\n", conn->session_id, (conn_wait_write == conn->status) ? "write" : "read");
-						all_idle = 0;
-						break;
-					case 1:
 						/* socket not busy, continue connect process */
 						switch(PQconnectPoll(conn->db_conn)) {
 							case PGRES_POLLING_WRITING:
 								conn->status = conn_wait_write;
+								FD_SET(conn->socket, &write_fds);
 								all_idle = 0;
 								break;
 							case PGRES_POLLING_READING:
 								conn->status = conn_wait_read;
+								FD_SET(conn->socket, &read_fds);
 								all_idle = 0;
 								break;
 							case PGRES_POLLING_OK:
@@ -483,31 +564,17 @@ int database_consumer(replay_item *item) {
 								PQfinish(conn->db_conn);
 						}
 						break;
-					default:
-						/* error happened in select() */
-						rc = -1;
-				}
-				break;
-
 			case wait_write:
-				/* check if the socket is writable */
-				switch (poll_socket(conn->socket, 0, "Error polling socket for write")) {
-					case 0:
-						/* socket still busy */
-						debug(2, "Session 0x" UINT64_FORMAT " busy writing data\n", conn->session_id);
-						all_idle = 0;
-						break;
-					case 1:
-						/* try PQflush again */
-						debug(2, "Session 0x" UINT64_FORMAT " flushing data\n", conn->session_id);
 						switch (PQflush(conn->db_conn)) {
 							case 0:
 								/* finished flushing all data */
 								conn->status = wait_read;
+								FD_SET(conn->socket, &read_fds);
 								all_idle = 0;
 								break;
 							case 1:
 								/* more data to flush */
+								FD_SET(conn->socket, &write_fds);
 								all_idle = 0;
 								break;
 							default:
@@ -515,21 +582,7 @@ int database_consumer(replay_item *item) {
 								rc = -1;
 						}
 						break;
-					default:
-						/* error in select() */
-						rc = -1;
-				}
-				break;
-
 			case wait_read:
-				/* check if the socket is readable */
-				switch (poll_socket(conn->socket, 1, "Error polling socket for read")) {
-					case 0:
-						/* socket still busy */
-						debug(2, "Session 0x" UINT64_FORMAT " waiting for data\n", conn->session_id);
-						all_idle = 0;
-						break;
-					case 1:
 						/* read input from connection */
 						if (! PQconsumeInput(conn->db_conn)) {
 							fprintf(stderr, "Error reading from database: %s\n", PQerrorMessage(conn->db_conn));
@@ -539,6 +592,7 @@ int database_consumer(replay_item *item) {
 							if (PQisBusy(conn->db_conn)) {
 								/* more to read */
 								all_idle = 0;
+								FD_SET(conn->socket, &read_fds);
 							} else {
 								/* read and discard all results */
 								while (NULL != (result = PQgetResult(conn->db_conn))) {
@@ -563,7 +617,10 @@ int database_consumer(replay_item *item) {
 
 									PQclear(result);
 								}
-
+								if (PQisBusy(conn->db_conn)) {
+									printf("Whoa - Still busy!\n");
+									exit(0);
+								}
 								/* one less concurrent statement */
 								--stat_statements;
 
@@ -609,41 +666,20 @@ int database_consumer(replay_item *item) {
 							}
 						}
 						break;
-					default:
-						/* error during select() */
-						rc = -1;
-				}
-				break;
 		}
+              }
+           }
+        }
 
-		if (! found_conn) {
-			/* remember previous item in list, useful for removing an item */
-			prev_conn = conn;
+	conn = connections;
+	while (conn) {
+		/* if we find the connection for the current statement, remember it */
+		if (session_id == conn->session_id) {
+			found_conn = conn;
+			break;
 		}
-
+		prev_conn = conn;
 		conn = conn->next;
-	}
-
-	/* make sure we found a connection above (except for connect items) */
-	if (1 == rc) {
-		if ((pg_connect == type) && (NULL != found_conn)) {
-			fprintf(stderr, "Error: connection for session 0x" UINT64_FORMAT " already exists\n", replay_get_session_id(item));
-			rc = -1;
-		} else if ((pg_connect != type) && (NULL == found_conn)) {
-			fprintf(stderr, "Error: no connection found for session 0x" UINT64_FORMAT "\n", replay_get_session_id(item));
-			rc = -1;
-		}
-	}
-
-	/* time when the statement originally ran */
-	stmt_time = replay_get_time(item);
-
-	/* set first_stmt_time if it is not yet set */
-	if (! fstmtm_set) {
-		first_stmt_time.tv_sec = stmt_time->tv_sec;
-		first_stmt_time.tv_usec = stmt_time->tv_usec;
-
-		fstmtm_set = 1;
 	}
 
 	/* get current time */
@@ -653,57 +689,6 @@ int database_consumer(replay_item *item) {
 			rc = -1;
 		}
 	}
-
-	/* determine if statement should already be consumed, sleep if necessary */
-	if (-1 != rc) {
-		/* calculate "target time" when item should be replayed:
-		                                       statement time - first statement time
-		   program start time - skipped time + -------------------------------------
-		                                                   replay factor            */
-
-		/* timestamp of the statement */
-		target_time.tv_sec = stmt_time->tv_sec;
-		target_time.tv_usec = stmt_time->tv_usec;
-
-		/* subtract time of first statement */
-		timersub(&target_time, &first_stmt_time, &target_time);
-
-		/* subtract skipped time */
-		if (jump_enabled) {
-			timersub(&target_time, &jump_total, &target_time);
-		}
-
-		/* divide by replay_factor */
-		if (replay_factor != 1.0) {
-			/* - divide the seconds part by the factor
-			   - divide the microsecond part by the factor and add the
-			     fractional part (times 10^6) of the previous division
-			   - if the result exceeds 10^6, subtract the excess and
-			     add its 10^6th to the seconds part. */
-			d = target_time.tv_sec / replay_factor;
-			target_time.tv_sec = d;
-			target_time.tv_usec = target_time.tv_usec / replay_factor +
-				(d - target_time.tv_sec) * 1000000.0;
-			i = target_time.tv_usec / 1000000;
-			target_time.tv_usec -= i * 1000000;
-			target_time.tv_sec += i;
-		}
-
-		/* add program start time */
-		timeradd(&target_time, &start_time, &target_time);
-
-		/* warn if we fall behind too much */
-		if (secs_behind < now.tv_sec - target_time.tv_sec) {
-			secs_behind = now.tv_sec - target_time.tv_sec;
-			for (j=0; j<NUM_DELAY_STEPS; ++j) {
-				if (! delay_steps[j].shown && delay_steps[j].seconds <= secs_behind) {
-					printf("Execution is %s behind schedule\n", delay_steps[j].display);
-					fflush(stdout);
-					delay_steps[j].shown = 1;
-				}
-			}
-		}
-
 		if (((target_time.tv_sec > now.tv_sec) ||
 				((target_time.tv_sec == now.tv_sec) && (target_time.tv_usec > now.tv_usec))) &&
 				all_idle) {
@@ -740,8 +725,10 @@ int database_consumer(replay_item *item) {
 			fprintf(stderr, "Connection 0x" UINT64_FORMAT " failed with FATAL error: %s\n",
 				found_conn->session_id, found_conn->errmsg);
 			rc = -1;
+		} else {
+			// We must wait for stuff to complete...
+			
 		}
-	}
 
 	/* send statement */
 	if (1 == rc) {
@@ -818,9 +805,10 @@ int database_consumer(replay_item *item) {
 									free(found_conn);
 								} else {
 									/* set values in struct dbconn */
-
+									fd_conn_map[found_conn->socket] = found_conn;
 									found_conn->session_id = replay_get_session_id(item);
 									found_conn->status = conn_wait_write;
+									FD_SET(found_conn->socket, &write_fds);
 									found_conn->errmsg = NULL;
 									found_conn->next = connections;
 
@@ -882,6 +870,7 @@ int database_consumer(replay_item *item) {
 					rc = -1;
 				} else {
 					found_conn->status = wait_write;
+					FD_SET(found_conn->socket, &write_fds);
 				}
 				break;
 			case pg_prepare:
@@ -890,6 +879,7 @@ int database_consumer(replay_item *item) {
 				/* count preparations for statistics */
 				++stat_prep;
 
+				if (PQisBusy(conn->db_conn)) exit(0);
 				if (! PQsendPrepare(
 						found_conn->db_conn,
 						replay_get_name(item),
@@ -900,6 +890,7 @@ int database_consumer(replay_item *item) {
 					rc = -1;
 				} else {
 					found_conn->status = wait_write;
+					FD_SET(found_conn->socket, &write_fds);
 				}
 				break;
 			case pg_exec_prepared:
@@ -917,6 +908,7 @@ int database_consumer(replay_item *item) {
 					rc = -1;
 				} else {
 					found_conn->status = wait_write;
+					FD_SET(found_conn->socket, &write_fds);
 				}
 				break;
 			case pg_cancel:
@@ -946,6 +938,8 @@ int database_consumer(replay_item *item) {
 			case 0:
 				/* complete request sent */
 				found_conn->status = wait_read;
+				FD_SET(found_conn->socket, &read_fds);
+				FD_CLR(found_conn->socket, &write_fds);
 				break;
 			case 1:
 				debug(2, "Session 0x" UINT64_FORMAT " needs to flush again\n", found_conn->session_id);

@@ -377,7 +377,8 @@ int main(int argc, char **argv) {
 		rc = 1;
 	}
 
-	while ((0 == rc) && (end_item != item)) {
+	int ctr = 99999999;
+	while (ctr-- && (0 == rc) && (end_item != item)) {
 		switch ((*consumer)(item)) {
 			case 0:     /* item not consumed */
 				break;
